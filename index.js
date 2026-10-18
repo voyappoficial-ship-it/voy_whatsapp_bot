@@ -220,8 +220,8 @@ async function startWhatsAppBot() {
         if (codeMatch) {
           const code = codeMatch[0].toUpperCase();
           await processVerification({ sock, remoteJid, senderRaw, code });
-        } else if (/hola|buenas|informacion|registro|voy/i.test(cleanText)) {
-          // Respuesta automática de bienvenida / ayuda
+        } else if (process.env.ENABLE_AUTO_WELCOME === 'true' && /hola|buenas|informacion|registro|voy/i.test(cleanText)) {
+          // Respuesta automática de bienvenida (solo si ENABLE_AUTO_WELCOME=true en .env)
           await sendWelcomeReply({ sock, remoteJid });
         }
       }
