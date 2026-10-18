@@ -280,28 +280,27 @@ async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [
       return;
     }
 
-    // Fallback inteligente: Si no coincidió el teléfono exacto, pero el código existe y está pendiente
-    // (Permite pruebas desde otro WhatsApp o si el número en el formulario tenía otro formato)
     if (!verRow) {
-      const { data: fallbackRow } = await supabase
+      // Verificar si el código existe pero pertenece a otro número de teléfono registrado
+      const { data: mismatchRow } = await supabase
         .from('phone_verifications')
         .select('*')
         .eq('code', code)
-        .eq('is_verified', false)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      if (fallbackRow) {
-        console.log(`💡 Coincidencia por código ${code} encontrada para ${fallbackRow.full_name} (registrado: ${fallbackRow.phone}, emisor WhatsApp: +${senderRaw})`);
-        verRow = fallbackRow;
+      if (mismatchRow) {
+        console.log(`🚫 RECHAZADO: El código ${code} fue solicitado para ${mismatchRow.full_name} (${mismatchRow.phone}), pero fue enviado desde otra línea (+${senderRaw}).`);
+        await sock.sendMessage(remoteJid, {
+          text: `🚫 *Verificación Rechazada - Voy Mototaxi*\n\nEl código *${code}* fue solicitado para el número *${mismatchRow.phone}*, pero estás enviando el mensaje desde otra línea (+${senderRaw}).\n\n🔒 *Por motivos de seguridad:* Debes enviar el código directamente desde el WhatsApp correspondiente al número que ingresaste en la app.`
+        });
+        return;
       }
-    }
 
-    if (!verRow) {
-      console.log(`⚠️ No se encontró registro para código ${code} y teléfono +${senderRaw}`);
+      console.log(`⚠️ Código ${code} no encontrado o inexistente para +${senderRaw}`);
       await sock.sendMessage(remoteJid, {
-        text: `⚠️ *Voy Mototaxi*\n\nNo encontramos ninguna solicitud pendiente con el código *${code}* para este número (+${senderRaw}).\n\nPor favor abre la app de *Voy* en tu teléfono, ingresa tus datos y genera un código nuevo.`
+        text: `⚠️ *Voy Mototaxi*\n\nEl código *${code}* no es válido o ha expirado.\n\nPor favor abre la app de *Voy* en tu teléfono, ingresa tus datos y genera un código nuevo.`
       });
       return;
     }
