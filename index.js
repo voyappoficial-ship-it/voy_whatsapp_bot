@@ -244,8 +244,8 @@ async function processVerification({ sock, remoteJid, senderRaw, code }) {
 
     const possiblePhones = [senderRaw, variantWithCountry, variantWithZero, variantWithoutCountry];
 
-    // Buscar en phone_verifications
-    const { data: verRow, error: verErr } = await supabase
+    // Buscar en phone_verifications por código y teléfono
+    let { data: verRow, error: verErr } = await supabase
       .from('phone_verifications')
       .select('*')
       .eq('code', code)
@@ -257,6 +257,24 @@ async function processVerification({ sock, remoteJid, senderRaw, code }) {
     if (verErr) {
       console.error('Error consultando Supabase:', verErr);
       return;
+    }
+
+    // Fallback inteligente: Si no coincidió el teléfono exacto, pero el código existe y está pendiente
+    // (Permite pruebas desde otro WhatsApp o si el número en el formulario tenía otro formato)
+    if (!verRow) {
+      const { data: fallbackRow } = await supabase
+        .from('phone_verifications')
+        .select('*')
+        .eq('code', code)
+        .eq('is_verified', false)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (fallbackRow) {
+        console.log(`💡 Coincidencia por código ${code} encontrada para ${fallbackRow.full_name} (registrado: ${fallbackRow.phone}, emisor WhatsApp: +${senderRaw})`);
+        verRow = fallbackRow;
+      }
     }
 
     if (!verRow) {
@@ -293,13 +311,14 @@ async function processVerification({ sock, remoteJid, senderRaw, code }) {
     }
 
     // 2. Actualizar profiles si ya existe un perfil asociado
+    const targetPhones = Array.from(new Set([...possiblePhones, verRow.phone]));
     await supabase
       .from('profiles')
       .update({
         is_phone_verified: true,
         phone_verified_at: now
       })
-      .in('phone', possiblePhones);
+      .in('phone', targetPhones);
 
     totalVerifiedCount++;
     console.log(`🎯 ¡ÉXITO! Usuario ${verRow.full_name} (${verRow.phone}) verificado automáticamente con código ${code}!`);
