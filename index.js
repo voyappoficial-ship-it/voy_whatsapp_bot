@@ -210,16 +210,32 @@ async function startWhatsAppBot() {
         const cleanText = messageText.trim();
         if (!cleanText) continue;
 
-        // Extraer número emisor
-        const senderRaw = remoteJid.split('@')[0].replace(/\D/g, '');
-        console.log(`📩 Mensaje entrante de +${senderRaw}: "${cleanText}"`);
+        // Extraer número emisor o identificador (manejo de WhatsApp LID y PN)
+        const isLid = remoteJid.includes('@lid');
+        const remoteRaw = remoteJid.split('@')[0].replace(/\D/g, '');
+        const senderPnRaw = msg.key?.senderPn ? msg.key.senderPn.split('@')[0].replace(/\D/g, '') : null;
+        const participantPnRaw = msg.key?.participantPn ? msg.key.participantPn.split('@')[0].replace(/\D/g, '') : null;
+        
+        // Extraer posible teléfono escrito en el texto (ej: "Número: 04121207791")
+        const textPhoneMatch = cleanText.match(/(?:04\d{9}|584\d{9})/);
+        const textPhone = textPhoneMatch ? textPhoneMatch[0].replace(/\D/g, '') : null;
+
+        // Número principal a mostrar e identificar
+        const displaySender = senderPnRaw || participantPnRaw || textPhone || remoteRaw;
+        console.log(`📩 Mensaje entrante de +${displaySender}${isLid ? ' [WhatsApp LID: ' + remoteRaw + ']' : ''}: "${cleanText}"`);
 
         // Buscar patrón de código VOY-XXXX (ej: VOY-7492)
         const codeMatch = cleanText.match(/VOY-\d{4}/i);
 
         if (codeMatch) {
           const code = codeMatch[0].toUpperCase();
-          await processVerification({ sock, remoteJid, senderRaw, code });
+          await processVerification({ 
+            sock, 
+            remoteJid, 
+            senderRaw: displaySender, 
+            extraPhones: [remoteRaw, senderPnRaw, participantPnRaw, textPhone].filter(Boolean), 
+            code 
+          });
         } else if (process.env.ENABLE_AUTO_WELCOME === 'true' && /hola|buenas|informacion|registro|voy/i.test(cleanText)) {
           // Respuesta automática de bienvenida (solo si ENABLE_AUTO_WELCOME=true en .env)
           await sendWelcomeReply({ sock, remoteJid });
@@ -232,17 +248,22 @@ async function startWhatsAppBot() {
 }
 
 // 5. Procesar y aprobar verificación en Supabase
-async function processVerification({ sock, remoteJid, senderRaw, code }) {
+async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [], code }) {
   try {
     console.log(`🔍 Buscando verificación pendiente para código ${code} y emisor +${senderRaw}...`);
 
-    // Crear variantes del teléfono para coincidencia segura
-    // ej: 584128353519, 04128353519, 4128353519
-    let variantWithoutCountry = senderRaw.startsWith('58') ? senderRaw.slice(2) : senderRaw;
-    let variantWithZero = '0' + variantWithoutCountry;
-    let variantWithCountry = '58' + variantWithoutCountry;
-
-    const possiblePhones = [senderRaw, variantWithCountry, variantWithZero, variantWithoutCountry];
+    // Crear variantes de todos los teléfonos detectados
+    const allCandidates = [senderRaw, ...extraPhones];
+    const possiblePhonesSet = new Set();
+    for (const ph of allCandidates) {
+      if (!ph) continue;
+      possiblePhonesSet.add(ph);
+      let withoutCountry = ph.startsWith('58') ? ph.slice(2) : ph;
+      possiblePhonesSet.add('0' + withoutCountry);
+      possiblePhonesSet.add('58' + withoutCountry);
+      possiblePhonesSet.add(withoutCountry);
+    }
+    const possiblePhones = Array.from(possiblePhonesSet);
 
     // Buscar en phone_verifications por código y teléfono
     let { data: verRow, error: verErr } = await supabase
