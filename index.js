@@ -60,6 +60,11 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
+// Health check para Railway
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', botStatus, connectedNumber });
+});
+
 // API: Estado en tiempo real del Bot y QR
 app.get('/api/status', async (req, res) => {
   if (currentQR && !currentQRDataUrl) {
@@ -252,7 +257,7 @@ app.listen(PORT, () => {
 });
 
 // 4. Conexión del Bot con Baileys
-const AUTH_DIR = path.join(__dirname, 'auth_info');
+const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
 if (!fs.existsSync(AUTH_DIR)) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 }
