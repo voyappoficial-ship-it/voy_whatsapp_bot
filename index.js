@@ -101,6 +101,12 @@ app.get('/api/messages', (req, res) => {
   });
 });
 
+// API: Limpiar historial de mensajes en memoria
+app.post('/api/clear-messages', (req, res) => {
+  botMessageHistory.length = 0;
+  res.json({ ok: true, message: 'Historial de mensajes limpiado exitosamente.' });
+});
+
 // API: Reiniciar conexión del bot
 app.post('/api/restart', async (req, res) => {
   try {
@@ -358,9 +364,26 @@ async function startWhatsAppBot() {
         // Ignorar mensajes enviados por el propio bot
         if (msg.key.fromMe) continue;
 
-        const remoteJid = msg.key.remoteJid;
-        // Ignorar grupos, estados y canales de difusión/newsletters
-        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('broadcast') || remoteJid.includes('@newsletter')) continue;
+        const remoteJid = msg.key?.remoteJid || '';
+        const rawId = remoteJid.split('@')[0].replace(/\D/g, '');
+
+        // 1. Filtrar grupos (@g.us), difusiones (broadcast), canales/newsletters (@newsletter) y anuncios
+        if (
+          !remoteJid ||
+          remoteJid.includes('@g.us') ||
+          remoteJid.includes('broadcast') ||
+          remoteJid.includes('@newsletter') ||
+          msg.broadcast ||
+          msg.key?.server === 'newsletter'
+        ) {
+          continue;
+        }
+
+        // 2. Filtrar IDs de canales y comunidades de WhatsApp (prefijo 120363 o IDs con más de 15 dígitos que no sean @lid)
+        // Ningún número de teléfono en el mundo bajo estándar ITU-T E.164 excede 15 dígitos
+        if (rawId.startsWith('120363') || (rawId.length > 15 && !remoteJid.includes('@lid'))) {
+          continue;
+        }
 
         // Extraer texto del mensaje
         const messageText =
@@ -374,7 +397,7 @@ async function startWhatsAppBot() {
 
         // Extraer remitente (resolviendo WhatsApp LID y Phone Number real)
         const isLid = remoteJid.includes('@lid');
-        const remoteRaw = remoteJid.split('@')[0].replace(/\D/g, '');
+        const remoteRaw = rawId;
         const senderPnRaw = msg.key?.senderPn ? msg.key.senderPn.split('@')[0].replace(/\D/g, '') : null;
         const participantPnRaw = msg.key?.participantPn ? msg.key.participantPn.split('@')[0].replace(/\D/g, '') : null;
         
@@ -383,6 +406,12 @@ async function startWhatsAppBot() {
         const textPhone = textPhoneMatch ? textPhoneMatch[0].replace(/\D/g, '') : null;
 
         const displaySender = senderPnRaw || participantPnRaw || textPhone || remoteRaw;
+
+        // 3. Salvaguarda final: descartar si el remitente final resuelto corresponde a un canal o identificador no-telefónico
+        if (displaySender.startsWith('120363') || (displaySender.length > 15 && !isLid)) {
+          continue;
+        }
+
         console.log(`📩 Mensaje entrante de +${displaySender}${isLid ? ' [WhatsApp LID: ' + remoteRaw + ']' : ''}: "${cleanText}"`);
 
         // Buscar patrón de código VOY-XXXX (ej: VOY-7492)
