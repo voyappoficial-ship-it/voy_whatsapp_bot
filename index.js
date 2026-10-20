@@ -18,7 +18,12 @@ if (!supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// 2. Estado Global y Memoria de Mensajes
+// 2. Directorio persistente de sesión y estado global
+const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
+if (!fs.existsSync(AUTH_DIR)) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+}
+
 let currentQR = null;
 let currentQRDataUrl = null;
 let botStatus = 'Iniciando...';
@@ -125,7 +130,6 @@ app.post('/api/logout', async (req, res) => {
       try { liveSocket.logout(); } catch (e) {}
       try { liveSocket.end(); } catch (e) {}
     }
-    const AUTH_DIR = path.join(__dirname, 'auth_info');
     if (fs.existsSync(AUTH_DIR)) {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -257,11 +261,6 @@ app.listen(PORT, () => {
 });
 
 // 4. Conexión del Bot con Baileys
-const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
-if (!fs.existsSync(AUTH_DIR)) {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-}
-
 async function startWhatsAppBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -273,6 +272,9 @@ async function startWhatsAppBot() {
     auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['Voy Mototaxi', 'Chrome', '1.0.0'],
+    syncFullHistory: false, // Optimización: no descargar años de historial antiguo, arranque veloz y bajo consumo de RAM
+    markOnlineOnConnect: true,
+    generateHighQualityLinkPreview: false,
     defaultQueryTimeoutMs: undefined,
   });
 
@@ -319,7 +321,16 @@ async function startWhatsAppBot() {
       if (shouldReconnect) {
         setTimeout(startWhatsAppBot, 5000);
       } else {
-        console.log('❌ Sesión cerrada por el usuario o desvinculada.');
+        console.log('❌ Sesión cerrada por el usuario o desvinculada desde el teléfono.');
+        try {
+          if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            fs.mkdirSync(AUTH_DIR, { recursive: true });
+          }
+        } catch (e) {}
+        botStatus = 'Esperando escaneo de QR';
+        connectedNumber = null;
+        setTimeout(startWhatsAppBot, 2000);
       }
     } else if (connection === 'open') {
       currentQR = null;
@@ -348,8 +359,8 @@ async function startWhatsAppBot() {
         if (msg.key.fromMe) continue;
 
         const remoteJid = msg.key.remoteJid;
-        // Ignorar grupos o estados
-        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('broadcast')) continue;
+        // Ignorar grupos, estados y canales de difusión/newsletters
+        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('broadcast') || remoteJid.includes('@newsletter')) continue;
 
         // Extraer texto del mensaje
         const messageText =
@@ -585,3 +596,27 @@ async function sendWelcomeReply({ sock, remoteJid }) {
 startWhatsAppBot().catch((err) => {
   console.error('Error fatal al iniciar bot:', err);
 });
+
+// Manejo de apagado limpio (Graceful Shutdown) en contenedores Railway
+process.on('SIGTERM', () => {
+  console.log('🛑 Señal SIGTERM recibida. Cerrando conexión de WhatsApp limpiamente...');
+  if (liveSocket) {
+    try { liveSocket.end(); } catch (e) {}
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('🛑 Señal SIGINT recibida. Cerrando...');
+  if (liveSocket) {
+    try { liveSocket.end(); } catch (e) {}
+  }
+  process.exit(0);
+});
+
+// Auto-ping de salud cada 10 minutos para mantener activo el contenedor
+setInterval(() => {
+  if (PORT) {
+    fetch(`http://localhost:${PORT}/health`).catch(() => {});
+  }
+}, 10 * 60 * 1000);
