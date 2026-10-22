@@ -7,12 +7,12 @@ const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 
-// 1. Inicializar Supabase
+// 1. Inicializar Supabase (Principio de Menor Privilegio)
 const supabaseUrl = process.env.SUPABASE_URL || 'https://tdhbsctrutzmmzqzinze.supabase.co';
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseKey) {
-  console.error('❌ ERROR: SUPABASE_SERVICE_ROLE_KEY no está definido en el archivo .env');
+  console.error('❌ ERROR: SUPABASE_ANON_KEY no está definido en el archivo .env');
   process.exit(1);
 }
 
@@ -455,10 +455,10 @@ async function startWhatsAppBot() {
   });
 }
 
-// 6. Procesar y aprobar verificación en Supabase
+// 6. Procesar y aprobar verificación en Supabase (Principio de Menor Privilegio)
 async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [], code, cleanText }) {
   try {
-    console.log(`🔍 Buscando verificación pendiente para código ${code} y emisor +${senderRaw}...`);
+    console.log(`🔍 Validando verificación para código ${code} y emisor +${senderRaw}...`);
 
     // Crear variantes de todos los teléfonos detectados
     const allCandidates = [senderRaw, ...extraPhones];
@@ -473,47 +473,19 @@ async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [
     }
     const possiblePhones = Array.from(possiblePhonesSet);
 
-    // Buscar en phone_verifications por código y teléfono
-    let { data: verRow, error: verErr } = await supabase
-      .from('phone_verifications')
-      .select('*')
-      .eq('code', code)
-      .in('phone', possiblePhones)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Llamar a la función RPC segura con principio de menor privilegio (compatible con anon key)
+    const { data: result, error: rpcErr } = await supabase.rpc('confirm_whatsapp_verification', {
+      p_code: code,
+      p_sender_phone: senderRaw,
+      p_possible_phones: possiblePhones,
+    });
 
-    if (verErr) {
-      console.error('Error consultando Supabase:', verErr);
+    if (rpcErr) {
+      console.error('Error invocando confirm_whatsapp_verification en Supabase:', rpcErr);
       return;
     }
 
-    if (!verRow) {
-      // Verificar si el código existe pero pertenece a otro número de teléfono registrado
-      const { data: mismatchRow } = await supabase
-        .from('phone_verifications')
-        .select('*')
-        .eq('code', code)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (mismatchRow) {
-        console.log(`🚫 RECHAZADO: El código ${code} fue solicitado para ${mismatchRow.full_name} (${mismatchRow.phone}), pero fue enviado desde otra línea (+${senderRaw}).`);
-        const rejectText = `🚫 *Verificación Rechazada - Voy Mototaxi*\n\nEl código *${code}* fue solicitado para el número *${mismatchRow.phone}*, pero estás enviando el mensaje desde otra línea (+${senderRaw}).\n\n🔒 *Por motivos de seguridad:* Debes enviar el código directamente desde el WhatsApp correspondiente al número que ingresaste en la app.`;
-        await sock.sendMessage(remoteJid, { text: rejectText });
-
-        addMessageLog({
-          sender: `+${senderRaw}`,
-          phone: senderRaw,
-          text: cleanText,
-          status: 'rejected',
-          reason: `Rechazado por seguridad: El código ${code} pertenece a ${mismatchRow.phone}, no a +${senderRaw}`,
-          reply: rejectText
-        });
-        return;
-      }
-
+    if (!result || result.status === 'not_found') {
       console.log(`⚠️ Código ${code} no encontrado o inexistente para +${senderRaw}`);
       const invalidText = `⚠️ *Voy Mototaxi*\n\nEl código *${code}* no es válido o ha expirado.\n\nPor favor abre la app de *Voy* en tu teléfono, ingresa tus datos y genera un código nuevo.`;
       await sock.sendMessage(remoteJid, { text: invalidText });
@@ -529,17 +501,30 @@ async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [
       return;
     }
 
-    const now = new Date().toISOString();
+    if (result.status === 'mismatch') {
+      console.log(`🚫 RECHAZADO: El código ${code} fue solicitado para ${result.expected_name} (${result.expected_phone}), pero fue enviado desde otra línea (+${senderRaw}).`);
+      const rejectText = `🚫 *Verificación Rechazada - Voy Mototaxi*\n\nEl código *${code}* fue solicitado para el número *${result.expected_phone}*, pero estás enviando el mensaje desde otra línea (+${senderRaw}).\n\n🔒 *Por motivos de seguridad:* Debes enviar el código directamente desde el WhatsApp correspondiente al número que ingresaste en la app.`;
+      await sock.sendMessage(remoteJid, { text: rejectText });
 
-    // Si ya estaba verificado
-    if (verRow.is_verified) {
+      addMessageLog({
+        sender: `+${senderRaw}`,
+        phone: senderRaw,
+        text: cleanText,
+        status: 'rejected',
+        reason: `Rechazado por seguridad: El código ${code} pertenece a ${result.expected_phone}, no a +${senderRaw}`,
+        reply: rejectText
+      });
+      return;
+    }
+
+    if (result.status === 'already_verified') {
       console.log(`ℹ️ El código ${code} ya había sido verificado anteriormente.`);
-      const alreadyText = `✅ *Voy Mototaxi*\n\n¡Hola *${verRow.full_name || 'Usuario'}*! Tu número ya se encuentra verificado en nuestro sistema.\n\nPuedes abrir la app de Voy e iniciar sesión con tu teléfono y contraseña.`;
+      const alreadyText = `✅ *Voy Mototaxi*\n\n¡Hola *${result.full_name || 'Usuario'}*! Tu número ya se encuentra verificado en nuestro sistema.\n\nPuedes abrir la app de Voy e iniciar sesión con tu teléfono y contraseña.`;
       await sock.sendMessage(remoteJid, { text: alreadyText });
 
       addMessageLog({
-        sender: verRow.full_name || `+${senderRaw}`,
-        phone: verRow.phone,
+        sender: result.full_name || `+${senderRaw}`,
+        phone: result.phone || senderRaw,
         text: cleanText,
         status: 'verified',
         reason: `El código ${code} ya estaba verificado previamente`,
@@ -548,36 +533,13 @@ async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [
       return;
     }
 
-    // 1. Actualizar phone_verifications a is_verified = true
-    const { error: updErr } = await supabase
-      .from('phone_verifications')
-      .update({
-        is_verified: true,
-        verified_at: now
-      })
-      .eq('id', verRow.id);
+    if (result.status === 'verified') {
+      totalVerifiedCount++;
+      console.log(`🎯 ¡ÉXITO! Usuario ${result.full_name} (${result.phone}) verificado automáticamente con código ${code}!`);
 
-    if (updErr) {
-      console.error('Error actualizando phone_verifications:', updErr);
-      return;
-    }
-
-    // 2. Actualizar profiles si ya existe un perfil asociado
-    const targetPhones = Array.from(new Set([...possiblePhones, verRow.phone]));
-    await supabase
-      .from('profiles')
-      .update({
-        is_phone_verified: true,
-        phone_verified_at: now
-      })
-      .in('phone', targetPhones);
-
-    totalVerifiedCount++;
-    console.log(`🎯 ¡ÉXITO! Usuario ${verRow.full_name} (${verRow.phone}) verificado automáticamente con código ${code}!`);
-
-    // 3. Responder al usuario en WhatsApp
-    const replyText = 
-`🏍️ *¡HOLA, ${verRow.full_name ? verRow.full_name.toUpperCase() : 'USUARIO'}!*
+      // Responder al usuario en WhatsApp
+      const replyText = 
+`🏍️ *¡HOLA, ${result.full_name ? result.full_name.toUpperCase() : 'USUARIO'}!*
 
 ✅ *¡Tu número ha sido verificado con éxito en Voy Mototaxi!*
 
@@ -590,17 +552,17 @@ Tu cuenta se desbloqueará automáticamente en la pantalla de tu teléfono. ¡Bi
 📍 *Voy Mototaxi — Píritu, Anzoátegui*
 _Tu viaje rápido, seguro y confiable._`;
 
-    await sock.sendMessage(remoteJid, { text: replyText });
+      await sock.sendMessage(remoteJid, { text: replyText });
 
-    addMessageLog({
-      sender: verRow.full_name || `+${senderRaw}`,
-      phone: verRow.phone,
-      text: cleanText,
-      status: 'verified',
-      reason: `✅ Código ${code} verificado con éxito para ${verRow.full_name} (${verRow.phone})`,
-      reply: replyText
-    });
-
+      addMessageLog({
+        sender: result.full_name || `+${senderRaw}`,
+        phone: result.phone || senderRaw,
+        text: cleanText,
+        status: 'verified',
+        reason: `✅ Código ${code} verificado con éxito para ${result.full_name} (${result.phone})`,
+        reply: replyText
+      });
+    }
   } catch (err) {
     console.error('Error en processVerification:', err);
   }
