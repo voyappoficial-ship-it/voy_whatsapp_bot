@@ -401,11 +401,14 @@ async function startWhatsAppBot() {
         const senderPnRaw = msg.key?.senderPn ? msg.key.senderPn.split('@')[0].replace(/\D/g, '') : null;
         const participantPnRaw = msg.key?.participantPn ? msg.key.participantPn.split('@')[0].replace(/\D/g, '') : null;
         
-        // Posible teléfono escrito en el texto (ej: "Número: 04121207791")
+        // Remitente telefónico auténtico validado por la conexión de WhatsApp
+        const realSenderPhone = senderPnRaw || participantPnRaw || (!isLid ? remoteRaw : null);
+
+        // Si es un LID anónimo sin número resuelto por WhatsApp, solo entonces se extrae del texto como último recurso
         const textPhoneMatch = cleanText.match(/(?:04\d{9}|584\d{9})/);
         const textPhone = textPhoneMatch ? textPhoneMatch[0].replace(/\D/g, '') : null;
 
-        const displaySender = senderPnRaw || participantPnRaw || textPhone || remoteRaw;
+        const displaySender = realSenderPhone || textPhone || remoteRaw;
 
         // 3. Salvaguarda final: descartar si el remitente final resuelto corresponde a un canal o identificador no-telefónico
         if (displaySender.startsWith('120363') || (displaySender.length > 15 && !isLid)) {
@@ -419,11 +422,17 @@ async function startWhatsAppBot() {
 
         if (codeMatch) {
           const code = codeMatch[0].toUpperCase();
+          // BLINDAJE ANTI-SUPLANTACIÓN: Solo incluir textPhone si WhatsApp NO nos proporcionó la línea emisora real (LID huérfano).
+          // Si el mensaje proviene de una línea de WhatsApp real, validamos ÚNICAMENTE contra la línea remitente auténtica.
+          const validCandidates = realSenderPhone 
+            ? [realSenderPhone, remoteRaw, senderPnRaw, participantPnRaw].filter(Boolean)
+            : [remoteRaw, textPhone].filter(Boolean);
+
           await processVerification({ 
             sock, 
             remoteJid, 
             senderRaw: displaySender, 
-            extraPhones: [remoteRaw, senderPnRaw, participantPnRaw, textPhone].filter(Boolean), 
+            extraPhones: validCandidates, 
             code,
             cleanText
           });
@@ -544,7 +553,7 @@ async function processVerification({ sock, remoteJid, senderRaw, extraPhones = [
 ✅ *¡Tu número ha sido verificado con éxito en Voy Mototaxi!*
 
 🔑 Código validado: *${code}*
-📱 Número confirmado: *+${senderRaw}*
+📱 Número confirmado: *+${result.phone || senderRaw}*
 
 📲 *Ya puedes regresar a la aplicación de Voy:*
 Tu cuenta se desbloqueará automáticamente en la pantalla de tu teléfono. ¡Bienvenido a la comunidad!
