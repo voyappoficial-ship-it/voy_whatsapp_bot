@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const QRCode = require('qrcode');
@@ -30,7 +30,26 @@ let botStatus = 'Iniciando...';
 let connectedNumber = null;
 let totalVerifiedCount = 0;
 let liveSocket = null;
+let isStartingBot = false;
+let reconnectTimer = null;
+let activeSocketId = 0;
 const botMessageHistory = [];
+
+function scheduleBotRestart(delayMs = 3000, reason = '') {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  console.log(`⏱️ Reinicio programado en ${delayMs}ms. Razón: ${reason || 'Automática'}`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startWhatsAppBot().catch(err => {
+      console.error('❌ Error en startWhatsAppBot programado:', err);
+      botStatus = 'Error al iniciar';
+      scheduleBotRestart(8000, 'Reintento tras error');
+    });
+  }, delayMs);
+}
 
 function addMessageLog({ id, type = 'incoming', sender, phone, text, status = 'info', reason = '', reply = null }) {
   const item = {
@@ -111,7 +130,11 @@ app.post('/api/clear-messages', (req, res) => {
 app.post('/api/restart', async (req, res) => {
   try {
     if (liveSocket) {
-      try { liveSocket.end(); } catch (e) {}
+      try {
+        liveSocket.ev.removeAllListeners();
+        liveSocket.end();
+      } catch (e) {}
+      liveSocket = null;
     }
     botStatus = 'Reiniciando conexión...';
     currentQR = null;
@@ -122,7 +145,7 @@ app.post('/api/restart', async (req, res) => {
       text: 'Reinicio de conexión solicitado desde el Panel de Control.',
       status: 'system'
     });
-    setTimeout(startWhatsAppBot, 1000);
+    scheduleBotRestart(1000, 'Solicitud desde Panel (/api/restart)');
     res.json({ ok: true, message: 'Bot reiniciándose...' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -133,12 +156,16 @@ app.post('/api/restart', async (req, res) => {
 app.post('/api/logout', async (req, res) => {
   try {
     if (liveSocket) {
+      try { liveSocket.ev.removeAllListeners(); } catch (e) {}
       try { liveSocket.logout(); } catch (e) {}
       try { liveSocket.end(); } catch (e) {}
+      liveSocket = null;
     }
     if (fs.existsSync(AUTH_DIR)) {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
+      try {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+      } catch (e) {}
     }
     botStatus = 'Esperando escaneo de QR';
     currentQR = null;
@@ -150,7 +177,7 @@ app.post('/api/logout', async (req, res) => {
       text: 'Sesión desvinculada por administrador. Generando nuevo código QR...',
       status: 'system'
     });
-    setTimeout(startWhatsAppBot, 1000);
+    scheduleBotRestart(1500, 'Solicitud desde Panel (/api/logout)');
     res.json({ ok: true, message: 'Sesión desvinculada. Generando nuevo código QR...' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -268,200 +295,254 @@ app.listen(PORT, () => {
 
 // 4. Conexión del Bot con Baileys
 async function startWhatsAppBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
+  if (isStartingBot) {
+    console.log('⏳ startWhatsAppBot ya está en progreso. Omitiendo llamada concurrente.');
+    return;
+  }
+  isStartingBot = true;
 
-  console.log(`🚀 Iniciando WhatsApp Web Socket (Versión ${version.join('.')} - Latest: ${isLatest})...`);
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    browser: ['Voy Mototaxi', 'Chrome', '1.0.0'],
-    syncFullHistory: false, // Optimización: no descargar años de historial antiguo, arranque veloz y bajo consumo de RAM
-    markOnlineOnConnect: true,
-    generateHighQualityLinkPreview: false,
-    defaultQueryTimeoutMs: undefined,
-  });
-
-  liveSocket = sock;
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      currentQR = qr;
-      try {
-        currentQRDataUrl = await QRCode.toDataURL(qr);
-      } catch (e) {}
-      botStatus = 'Esperando escaneo de QR';
-      console.log('\n📌 CÓDIGO QR RECIBIDO. Escanéalo en la terminal o en tu panel: http://localhost:5173/verifications');
-      QRCode.toString(qr, { type: 'terminal', small: true }, (err, qrStr) => {
-        if (!err && qrStr) console.log(qrStr);
-      });
-      addMessageLog({
-        type: 'system',
-        sender: 'Sistema',
-        text: 'Código QR generado. Listo para escanear desde WhatsApp > Dispositivos vinculados.',
-        status: 'system'
-      });
+  // 1. Limpieza rigurosa del socket previo para evitar sockets duplicados en memoria
+  if (liveSocket) {
+    console.log('🧹 Limpiando listeners y cerrando socket previo antes de iniciar uno nuevo...');
+    try {
+      liveSocket.ev.removeAllListeners();
+      liveSocket.end();
+    } catch (e) {
+      console.warn('Advertencia al cerrar liveSocket previo:', e.message);
     }
+    liveSocket = null;
+  }
 
-    if (connection === 'close') {
-      currentQR = null;
-      currentQRDataUrl = null;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+  const thisSocketId = ++activeSocketId;
 
-      botStatus = `Desconectado (${statusCode || 'error'})`;
-      console.log(`⚠️ Conexión cerrada. Código: ${statusCode}. Reconectando: ${shouldReconnect}`);
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
 
-      addMessageLog({
-        type: 'system',
-        sender: 'Sistema',
-        text: `Conexión cerrada (Código: ${statusCode || 'desconocido'}). Reconectando: ${shouldReconnect}`,
-        status: 'system'
-      });
+    console.log(`🚀 Iniciando WhatsApp Web Socket #${thisSocketId} (Versión ${version.join('.')} - Latest: ${isLatest})...`);
 
-      if (shouldReconnect) {
-        setTimeout(startWhatsAppBot, 5000);
-      } else {
-        console.log('❌ Sesión cerrada por el usuario o desvinculada desde el teléfono.');
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      browser: Browsers.ubuntu('Desktop'),
+      syncFullHistory: false, // Optimización: no descargar años de historial antiguo, arranque veloz y bajo consumo de RAM
+      markOnlineOnConnect: true,
+      generateHighQualityLinkPreview: false,
+      defaultQueryTimeoutMs: undefined,
+    });
+
+    liveSocket = sock;
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      // Si este socket ya no es el socket activo, ignorar eventos y destruirlo
+      if (thisSocketId !== activeSocketId) {
+        console.log(`⚠️ Evento de conexión recibido de socket huérfano #${thisSocketId}. Descartando.`);
+        try { sock.ev.removeAllListeners(); sock.end(); } catch (e) {}
+        return;
+      }
+
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        currentQR = qr;
         try {
-          if (fs.existsSync(AUTH_DIR)) {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-            fs.mkdirSync(AUTH_DIR, { recursive: true });
-          }
+          currentQRDataUrl = await QRCode.toDataURL(qr);
         } catch (e) {}
         botStatus = 'Esperando escaneo de QR';
-        connectedNumber = null;
-        setTimeout(startWhatsAppBot, 2000);
+        console.log('\n📌 CÓDIGO QR RECIBIDO. Escanéalo en la terminal o en tu panel: http://localhost:5173/verifications');
+        QRCode.toString(qr, { type: 'terminal', small: true }, (err, qrStr) => {
+          if (!err && qrStr) console.log(qrStr);
+        });
+        addMessageLog({
+          type: 'system',
+          sender: 'Sistema',
+          text: 'Código QR generado. Listo para escanear desde WhatsApp > Dispositivos vinculados.',
+          status: 'system'
+        });
       }
-    } else if (connection === 'open') {
-      currentQR = null;
-      currentQRDataUrl = null;
-      botStatus = 'Conectado';
-      connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Conectado';
-      console.log(`\n🎉 ¡CONECTADO CON ÉXITO A WHATSAPP!`);
-      console.log(`📱 Número de WhatsApp activo: +${connectedNumber}\n`);
 
-      addMessageLog({
-        type: 'system',
-        sender: 'WhatsApp Central',
-        text: `¡Bot conectado con éxito a la línea +${connectedNumber}! Escuchando mensajes en vivo.`,
-        status: 'verified'
-      });
-    }
-  });
+      if (connection === 'close') {
+        currentQR = null;
+        currentQRDataUrl = null;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const isReplaced = statusCode === DisconnectReason.connectionReplaced || statusCode === 440;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
-  // 5. Procesar mensajes entrantes en tiempo real
-  sock.ev.on('messages.upsert', async (m) => {
-    try {
-      if (m.type !== 'notify') return;
+        botStatus = isReplaced ? 'Sesión reemplazada (440)' : `Desconectado (${statusCode || 'error'})`;
+        console.log(`⚠️ Conexión cerrada en socket #${thisSocketId}. Código: ${statusCode}. Replaced: ${isReplaced}. LoggedOut: ${isLoggedOut}.`);
 
-      for (const msg of m.messages) {
-        // Ignorar mensajes enviados por el propio bot
-        if (msg.key.fromMe) continue;
+        addMessageLog({
+          type: 'system',
+          sender: 'Sistema',
+          text: isReplaced
+            ? 'Conexión reemplazada (Código: 440). Desvincula sesiones antiguas en tu WhatsApp si el error persiste.'
+            : `Conexión cerrada (Código: ${statusCode || 'desconocido'}). Reconectando...`,
+          status: 'system'
+        });
 
-        const remoteJid = msg.key?.remoteJid || '';
-        const rawId = remoteJid.split('@')[0].replace(/\D/g, '');
-
-        // 1. Filtrar grupos (@g.us), difusiones (broadcast), canales/newsletters (@newsletter) y anuncios
-        if (
-          !remoteJid ||
-          remoteJid.includes('@g.us') ||
-          remoteJid.includes('broadcast') ||
-          remoteJid.includes('@newsletter') ||
-          msg.broadcast ||
-          msg.key?.server === 'newsletter'
-        ) {
-          continue;
+        // Limpiar listeners de este socket para que no sigan ejecutándose
+        try { sock.ev.removeAllListeners(); } catch (e) {}
+        if (liveSocket === sock) {
+          liveSocket = null;
         }
 
-        // 2. Filtrar IDs de canales y comunidades de WhatsApp (prefijo 120363 o IDs con más de 15 dígitos que no sean @lid)
-        // Ningún número de teléfono en el mundo bajo estándar ITU-T E.164 excede 15 dígitos
-        if (rawId.startsWith('120363') || (rawId.length > 15 && !remoteJid.includes('@lid'))) {
-          continue;
-        }
-
-        // Extraer texto del mensaje
-        const messageText =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          '';
-
-        const cleanText = messageText.trim();
-        if (!cleanText) continue;
-
-        // Extraer remitente (resolviendo WhatsApp LID y Phone Number real)
-        const isLid = remoteJid.includes('@lid');
-        const remoteRaw = rawId;
-        const senderPnRaw = msg.key?.senderPn ? msg.key.senderPn.split('@')[0].replace(/\D/g, '') : null;
-        const participantPnRaw = msg.key?.participantPn ? msg.key.participantPn.split('@')[0].replace(/\D/g, '') : null;
-        
-        // Remitente telefónico auténtico validado por la conexión de WhatsApp
-        const realSenderPhone = senderPnRaw || participantPnRaw || (!isLid ? remoteRaw : null);
-
-        // Si es un LID anónimo sin número resuelto por WhatsApp, solo entonces se extrae del texto como último recurso
-        const textPhoneMatch = cleanText.match(/(?:04\d{9}|584\d{9})/);
-        const textPhone = textPhoneMatch ? textPhoneMatch[0].replace(/\D/g, '') : null;
-
-        const displaySender = realSenderPhone || textPhone || remoteRaw;
-
-        // 3. Salvaguarda final: descartar si el remitente final resuelto corresponde a un canal o identificador no-telefónico
-        if (displaySender.startsWith('120363') || (displaySender.length > 15 && !isLid)) {
-          continue;
-        }
-
-        console.log(`📩 Mensaje entrante de +${displaySender}${isLid ? ' [WhatsApp LID: ' + remoteRaw + ']' : ''}: "${cleanText}"`);
-
-        // Buscar patrón de código VOY-XXXX (ej: VOY-7492)
-        const codeMatch = cleanText.match(/VOY-\d{4}/i);
-
-        if (codeMatch) {
-          const code = codeMatch[0].toUpperCase();
-          // BLINDAJE ANTI-SUPLANTACIÓN: Solo incluir textPhone si WhatsApp NO nos proporcionó la línea emisora real (LID huérfano).
-          // Si el mensaje proviene de una línea de WhatsApp real, validamos ÚNICAMENTE contra la línea remitente auténtica.
-          const validCandidates = realSenderPhone 
-            ? [realSenderPhone, remoteRaw, senderPnRaw, participantPnRaw].filter(Boolean)
-            : [remoteRaw, textPhone].filter(Boolean);
-
-          await processVerification({ 
-            sock, 
-            remoteJid, 
-            senderRaw: displaySender, 
-            extraPhones: validCandidates, 
-            code,
-            cleanText
-          });
-        } else if (process.env.ENABLE_AUTO_WELCOME === 'true' && /hola|buenas|informacion|registro|voy/i.test(cleanText)) {
-          await sendWelcomeReply({ sock, remoteJid });
-          addMessageLog({
-            sender: `+${displaySender}`,
-            phone: displaySender,
-            text: cleanText,
-            status: 'info',
-            reason: 'Saludo de bienvenida enviado',
-            reply: '👋 ¡Hola! Te has comunicado con la línea oficial de Voy Mototaxi...'
-          });
+        if (isLoggedOut) {
+          console.log('❌ Sesión cerrada por el usuario o desvinculada desde el teléfono.');
+          try {
+            if (fs.existsSync(AUTH_DIR)) {
+              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+              fs.mkdirSync(AUTH_DIR, { recursive: true });
+            }
+          } catch (e) {}
+          botStatus = 'Esperando escaneo de QR';
+          connectedNumber = null;
+          scheduleBotRestart(3000, 'Sesión desvinculada (loggedOut)');
+        } else if (isReplaced) {
+          console.log('⚠️ Código 440 (connectionReplaced): Esperando 8s antes de reconectar para evitar colisión de sockets...');
+          scheduleBotRestart(8000, 'Reintento tras connectionReplaced 440');
         } else {
-          // MODO QUIRÚRGICO: Registrar en el feed del panel para monitoreo pero NO responder nada por privacidad
-          addMessageLog({
-            sender: `+${displaySender}`,
-            phone: displaySender,
-            text: cleanText,
-            status: 'ignored',
-            reason: 'Conversación personal/privada ignorada (Modo Quirúrgico)',
-            reply: '(Sin respuesta por privacidad)'
-          });
+          // Desconexión temporal
+          scheduleBotRestart(5000, `Reconexión automática tras código ${statusCode || 'desconocido'}`);
         }
+      } else if (connection === 'open') {
+        currentQR = null;
+        currentQRDataUrl = null;
+        botStatus = 'Conectado';
+        connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Conectado';
+        console.log(`\n🎉 ¡CONECTADO CON ÉXITO A WHATSAPP!`);
+        console.log(`📱 Número de WhatsApp activo: +${connectedNumber}\n`);
+
+        addMessageLog({
+          type: 'system',
+          sender: 'WhatsApp Central',
+          text: `¡Bot conectado con éxito a la línea +${connectedNumber}! Escuchando mensajes en vivo.`,
+          status: 'verified'
+        });
       }
-    } catch (err) {
-      console.error('Error procesando mensaje entrante:', err);
-    }
-  });
+    });
+
+    // 5. Procesar mensajes entrantes en tiempo real
+    sock.ev.on('messages.upsert', async (m) => {
+      if (thisSocketId !== activeSocketId) return;
+      try {
+        if (m.type !== 'notify') return;
+
+        for (const msg of m.messages) {
+          // Ignorar mensajes enviados por el propio bot
+          if (msg.key.fromMe) continue;
+
+          const remoteJid = msg.key?.remoteJid || '';
+          const rawId = remoteJid.split('@')[0].replace(/\D/g, '');
+
+          // 1. Filtrar grupos (@g.us), difusiones (broadcast), canales/newsletters (@newsletter) y anuncios
+          if (
+            !remoteJid ||
+            remoteJid.includes('@g.us') ||
+            remoteJid.includes('broadcast') ||
+            remoteJid.includes('@newsletter') ||
+            msg.broadcast ||
+            msg.key?.server === 'newsletter'
+          ) {
+            continue;
+          }
+
+          // 2. Filtrar IDs de canales y comunidades de WhatsApp (prefijo 120363 o IDs con más de 15 dígitos que no sean @lid)
+          // Ningún número de teléfono en el mundo bajo estándar ITU-T E.164 excede 15 dígitos
+          if (rawId.startsWith('120363') || (rawId.length > 15 && !remoteJid.includes('@lid'))) {
+            continue;
+          }
+
+          // Extraer texto del mensaje
+          const messageText =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            '';
+
+          const cleanText = messageText.trim();
+          if (!cleanText) continue;
+
+          // Extraer remitente (resolviendo WhatsApp LID y Phone Number real)
+          const isLid = remoteJid.includes('@lid');
+          const remoteRaw = rawId;
+          const senderPnRaw = msg.key?.senderPn ? msg.key.senderPn.split('@')[0].replace(/\D/g, '') : null;
+          const participantPnRaw = msg.key?.participantPn ? msg.key.participantPn.split('@')[0].replace(/\D/g, '') : null;
+          
+          // Remitente telefónico auténtico validado por la conexión de WhatsApp
+          const realSenderPhone = senderPnRaw || participantPnRaw || (!isLid ? remoteRaw : null);
+
+          // Si es un LID anónimo sin número resuelto por WhatsApp, solo entonces se extrae del texto como último recurso
+          const textPhoneMatch = cleanText.match(/(?:04\d{9}|584\d{9})/);
+          const textPhone = textPhoneMatch ? textPhoneMatch[0].replace(/\D/g, '') : null;
+
+          const displaySender = realSenderPhone || textPhone || remoteRaw;
+
+          // 3. Salvaguarda final: descartar si el remitente final resuelto corresponde a un canal o identificador no-telefónico
+          if (displaySender.startsWith('120363') || (displaySender.length > 15 && !isLid)) {
+            continue;
+          }
+
+          console.log(`📩 Mensaje entrante de +${displaySender}${isLid ? ' [WhatsApp LID: ' + remoteRaw + ']' : ''}: "${cleanText}"`);
+
+          // Buscar patrón de código VOY-XXXX (ej: VOY-7492)
+          const codeMatch = cleanText.match(/VOY-\d{4}/i);
+
+          if (codeMatch) {
+            const code = codeMatch[0].toUpperCase();
+            // BLINDAJE ANTI-SUPLANTACIÓN: Solo incluir textPhone si WhatsApp NO nos proporcionó la línea emisora real (LID huérfano).
+            // Si el mensaje proviene de una línea de WhatsApp real, validamos ÚNICAMENTE contra la línea remitente auténtica.
+            const validCandidates = realSenderPhone 
+              ? [realSenderPhone, remoteRaw, senderPnRaw, participantPnRaw].filter(Boolean)
+              : [remoteRaw, textPhone].filter(Boolean);
+
+            await processVerification({ 
+              sock, 
+              remoteJid, 
+              senderRaw: displaySender, 
+              extraPhones: validCandidates, 
+              code,
+              cleanText
+            });
+          } else if (process.env.ENABLE_AUTO_WELCOME === 'true' && /hola|buenas|informacion|registro|voy/i.test(cleanText)) {
+            await sendWelcomeReply({ sock, remoteJid });
+            addMessageLog({
+              sender: `+${displaySender}`,
+              phone: displaySender,
+              text: cleanText,
+              status: 'info',
+              reason: 'Saludo de bienvenida enviado',
+              reply: '👋 ¡Hola! Te has comunicado con la línea oficial de Voy Mototaxi...'
+            });
+          } else {
+            // MODO QUIRÚRGICO: Registrar en el feed del panel para monitoreo pero NO responder nada por privacidad
+            addMessageLog({
+              sender: `+${displaySender}`,
+              phone: displaySender,
+              text: cleanText,
+              status: 'ignored',
+              reason: 'Conversación personal/privada ignorada (Modo Quirúrgico)',
+              reply: '(Sin respuesta por privacidad)'
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error procesando mensaje entrante:', err);
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fatal al inicializar socket de Baileys:', error);
+    botStatus = 'Error al conectar';
+    scheduleBotRestart(8000, 'Reintento tras fallo de inicialización');
+  } finally {
+    isStartingBot = false;
+  }
 }
 
 // 6. Procesar y aprobar verificación en Supabase (Principio de Menor Privilegio)
